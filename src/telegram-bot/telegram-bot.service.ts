@@ -3,6 +3,7 @@ import { Telegraf, Context } from 'telegraf';
 import { CommandRouter } from './routers/command.router';
 import { TextRouter } from './routers/text.router';
 import { CallbackRouter } from './routers/callback.router';
+import { MembershipRouter } from './routers/membership.router';
 
 @Injectable()
 export class TelegramBotService implements OnModuleInit {
@@ -13,6 +14,7 @@ export class TelegramBotService implements OnModuleInit {
     private readonly commandRouter: CommandRouter,
     private readonly textRouter: TextRouter,
     private readonly callbackRouter: CallbackRouter,
+    private readonly membershipRouter: MembershipRouter,
   ) {}
 
   async onModuleInit() {
@@ -42,7 +44,10 @@ export class TelegramBotService implements OnModuleInit {
     // Централизованный обработчик callback_query (кнопки)
     this.bot.on('callback_query', (ctx) => this.callbackRouter.route(ctx));
 
-    this.bot.launch();
+    // Централизованный обработчик my_chat_member (добавление бота)
+    this.bot.on('my_chat_member', (ctx) => this.membershipRouter.route(ctx));
+
+    await this.bot.launch();
     this.logger.log('Telegram bot launched');
   }
 }
