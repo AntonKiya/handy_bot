@@ -7,6 +7,8 @@ import { MenuModule } from '../modules/menu/menu.module';
 import { SummaryChannelModule } from '../modules/summary-channel/summary-channel.module';
 import { SummaryCommentsModule } from '../modules/summary-comments/summary-comments.module';
 import { StateModule } from '../common/state/state.module';
+import { MembershipRouter } from './routers/membership.router';
+import { UserChannelsModule } from '../modules/user-channels/user-channels.module';
 
 @Module({
   imports: [
@@ -14,7 +16,14 @@ import { StateModule } from '../common/state/state.module';
     StateModule,
     SummaryChannelModule,
     SummaryCommentsModule,
+    UserChannelsModule,
   ],
-  providers: [TelegramBotService, CommandRouter, TextRouter, CallbackRouter],
+  providers: [
+    TelegramBotService,
+    CommandRouter,
+    TextRouter,
+    CallbackRouter,
+    MembershipRouter,
+  ],
 })
 export class TelegramBotModule {}
