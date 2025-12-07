@@ -9,6 +9,7 @@ import { SummaryCommentsModule } from '../modules/summary-comments/summary-comme
 import { StateModule } from '../common/state/state.module';
 import { MembershipRouter } from './routers/membership.router';
 import { UserChannelsModule } from '../modules/user-channels/user-channels.module';
+import { CoreChannelUsersModule } from '../modules/core-channel-users/core-channel-users.module';
 
 @Module({
   imports: [
@@ -17,6 +18,7 @@ import { UserChannelsModule } from '../modules/user-channels/user-channels.modul
     SummaryChannelModule,
     SummaryCommentsModule,
     UserChannelsModule,
+    CoreChannelUsersModule,
   ],
   providers: [
     TelegramBotService,

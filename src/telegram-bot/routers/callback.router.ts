@@ -6,6 +6,8 @@ import { SummaryCommentsFlow } from '../../modules/summary-comments/summary-comm
 import { SUMMARY_COMMENTS_NAMESPACE } from '../../modules/summary-comments/summary-comments.callbacks';
 import { UserChannelsFlowService } from '../../modules/user-channels/user-channels-flow.service';
 import { CHANNELS_NAMESPACE } from '../../modules/user-channels/user-channels.callbacks';
+import { CORE_CHANNEL_USERS_NAMESPACE } from '../../modules/core-channel-users/core-channel-users.callbacks';
+import { CoreChannelUsersFlow } from '../../modules/core-channel-users/core-channel-users.flow';
 
 @Injectable()
 export class CallbackRouter {
@@ -15,6 +17,7 @@ export class CallbackRouter {
     private readonly summaryChannelFlow: SummaryChannelFlow,
     private readonly summaryCommentsFlow: SummaryCommentsFlow,
     private readonly userChannelsFlow: UserChannelsFlowService,
+    private readonly coreChannelUsersFlow: CoreChannelUsersFlow,
   ) {}
 
   async route(ctx: Context) {
@@ -41,6 +44,10 @@ export class CallbackRouter {
 
     if (data.startsWith(`${CHANNELS_NAMESPACE}:`)) {
       return this.userChannelsFlow.handleCallback(ctx, data);
+    }
+
+    if (data.startsWith(`${CORE_CHANNEL_USERS_NAMESPACE}:`)) {
+      return this.coreChannelUsersFlow.handleCallback(ctx, data);
     }
   }
 }
