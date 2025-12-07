@@ -102,7 +102,10 @@ export class UserChannelsService {
 
     // 4) Апсерт канал
     await this.channelRepository.upsert(
-      { telegram_chat_id: chatId },
+      {
+        telegram_chat_id: chatId,
+        username: chat.username ?? null,
+      },
       { conflictPaths: ['telegram_chat_id'] },
     );
     const channel = await this.channelRepository.findOne({

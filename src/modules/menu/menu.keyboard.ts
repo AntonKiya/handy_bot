@@ -2,6 +2,10 @@ import { Markup } from 'telegraf';
 import { SUMMARY_CHANNEL_CB } from '../summary-channel/summary-channel.callbacks';
 import { SUMMARY_COMMENTS_CB } from '../summary-comments/summary-comments.callbacks';
 import { CHANNELS_CB } from '../user-channels/user-channels.callbacks';
+import {
+  CORE_CHANNEL_USERS_NAMESPACE,
+  CoreChannelUsersAction,
+} from '../core-channel-users/core-channel-users.callbacks';
 
 export function buildMainMenuKeyboard() {
   return Markup.inlineKeyboard([
@@ -13,5 +17,11 @@ export function buildMainMenuKeyboard() {
       ),
     ],
     [Markup.button.callback('Мои каналы 📝👑', CHANNELS_CB.open)],
+    [
+      Markup.button.callback(
+        'Ядро пользователей сообщества',
+        `${CORE_CHANNEL_USERS_NAMESPACE}:${CoreChannelUsersAction.Open}`,
+      ),
+    ],
   ]);
 }
