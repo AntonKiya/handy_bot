@@ -17,6 +17,13 @@ const SYNC_WINDOW_DAYS = 90;
 const SYNC_COOLDOWN_DAYS = 1;
 const TOP_USERS_AMOUNT = 10;
 
+// Гибридная логика по возрасту постов
+const MS_PER_DAY = 24 * 60 * 60 * 1000;
+const FRESH_POST_DAYS = 3; // 0–3 дня - всегда ресинк при синке канала
+const MEDIUM_POST_DAYS = 10; // 3–10 дней - периодический ресинк
+const MEDIUM_RESYNC_INTERVAL_HOURS = 48;
+const MEDIUM_RESYNC_INTERVAL_MS = MEDIUM_RESYNC_INTERVAL_HOURS * 60 * 60 * 1000; // интервал для пересинхронизации постов средней давности в миллисекундах
+
 export interface CoreUserReportItem {
   telegramUserId: number;
   commentsCount: number;
@@ -52,19 +59,18 @@ export class CoreChannelUsersService {
   ) {}
 
   /**
-   * Проверяет лимиты (не чаще 1 раза в 1 день),
-   * при необходимости синкает свежие посты и их комментарии,
-   * чистит комментарии, вышедшие из окна,
-   * считает топ N пользователей по числу комментариев за окно.
+   * Строит отчёт по ядру комментаторов для канала:
+   * - Проверяет cooldown (не чаще 1 раза в день);
+   * - При необходимости синхронизирует посты и комментарии (гибридная схема 0–3 / 3–10 / >10 дней);
+   * - Чистит комментарии, вышедшие за окно;
+   * - Считает топ N пользователей по числу комментариев за окно.
    */
   async buildCoreUsersReportForChannel(
     telegramChatId: number,
   ): Promise<CoreChannelUsersReportResult> {
     const now = new Date();
     const windowTo = now;
-    const windowFrom = new Date(
-      now.getTime() - SYNC_WINDOW_DAYS * 24 * 60 * 60 * 1000,
-    );
+    const windowFrom = new Date(now.getTime() - SYNC_WINDOW_DAYS * MS_PER_DAY);
 
     // 1. Находим канал по telegram_chat_id
     const channel = await this.channelRepo.findOne({
@@ -118,18 +124,18 @@ export class CoreChannelUsersService {
 
   /**
    * Проверка cooldown по каналу и запуск синка.
-   * Note:
-   * - Если лимит по времени ещё не вышел, синхронизации с Telegram не происходит,
-   *   Возвращяется synced = false (данные берём из БД как есть).
-   * - Если синк разрешён, мы всегда обновляем last_synced_at для канала,
-   *   даже если новых постов не оказалось, чтобы пользователь не нагружал API Telegram.
+   *
+   * ВАЖНО:
+   * - Если cooldown ещё не прошёл, в Telegram не идём, возвращаем synced=false.
+   * - Если синк разрешён, мы ВСЕГДА обновляем lastSyncedAt для канала,
+   *   даже если новых/подходящих постов не нашлось (чтобы нельзя было абузить).
    */
   private async syncChannel(
     channel: Channel,
     windowFrom: Date,
   ): Promise<{ synced: boolean }> {
     const now = new Date();
-    const cooldownMs = SYNC_COOLDOWN_DAYS * 24 * 60 * 60 * 1000;
+    const cooldownMs = SYNC_COOLDOWN_DAYS * MS_PER_DAY;
 
     let channelSync = await this.channelSyncRepo.findOne({
       where: { channel: { id: channel.id } },
@@ -146,10 +152,24 @@ export class CoreChannelUsersService {
       return { synced: false };
     }
 
-    // Синк разрешён - обновляем данные по новым постам.
-    await this.syncNewPostsForChannel(channel, windowFrom, now);
+    // Перед синком фиксируем максимальный telegram_post_id, который уже есть в БД.
+    const lastPostBefore = await this.channelPostRepo
+      .createQueryBuilder('p')
+      .where('p.channel_id = :channelId', { channelId: channel.id })
+      .orderBy('p.telegram_post_id', 'DESC')
+      .getOne();
 
-    // Обновляем / создаём запись о синке канала
+    const maxTelegramPostIdBefore = lastPostBefore
+      ? Number(lastPostBefore.telegram_post_id)
+      : 0;
+
+    await this.syncPostsAndCommentsForChannel(
+      channel,
+      windowFrom,
+      now,
+      maxTelegramPostIdBefore,
+    );
+
     if (!channelSync) {
       channelSync = this.channelSyncRepo.create({
         channel,
@@ -166,23 +186,23 @@ export class CoreChannelUsersService {
   }
 
   /**
-   * TODO:
-   * MVP: Синхронизируем только НОВЫЕ посты канала (те, которых ещё нет в channel_posts),
-   * забираем по ним комментарии и сохраняем всё в БД.
-   *
-   * ВАЖНО:
-   * - Не пересинхронизируем старые посты (поэтому late-комменты к старым постам MVP не увидит).
-   * - Берём посты только "сверху" — с ID больше максимального, который у нас уже есть.
-   * - Запросы к Telegram делаем с лимитом и оставляем TODO для полноценной пагинации.
+   * Гибридная синхронизация:
+   * 1) Сначала подтягиваем ВСЕ новые посты (id > maxTelegramPostIdBefore),
+   *    для каждого сразу синкаем все комментарии.
+   * 2) Затем для уже существующих постов внутри окна:
+   *    - 0–3 дней: всегда пересинхронизируем комментарии;
+   *    - 3–10 дней: пересинхронизируем, если прошло >= 48 часов с последнего синка поста;
+   *    - >10 дней: больше не трогаем (используем только уже накопленные комментарии).
    */
-  private async syncNewPostsForChannel(
+  private async syncPostsAndCommentsForChannel(
     channel: Channel,
     windowFrom: Date,
     now: Date,
+    maxTelegramPostIdBefore: number,
   ): Promise<void> {
     if (!channel.username) {
       this.logger.warn(
-        `syncNewPostsForChannel: channel ${channel.id} has no username, cannot resolve via Core API`,
+        `syncPostsAndCommentsForChannel: channel ${channel.id} has no username, cannot resolve via Core API`,
       );
       return;
     }
@@ -191,92 +211,251 @@ export class CoreChannelUsersService {
     const username = channel.username;
 
     this.logger.debug(
-      `syncNewPostsForChannel: fetching new posts for @${username}`,
+      `syncPostsAndCommentsForChannel: syncing posts & comments for @${username}`,
     );
 
     const tgChannel = await client.getEntity(username);
 
-    // Находим максимальный telegram_post_id, который у нас уже есть для этого канала
-    const lastPost = await this.channelPostRepo
-      .createQueryBuilder('p')
-      .where('p.channel_id = :channelId', { channelId: channel.id })
-      .orderBy('p.telegram_post_id', 'DESC')
-      .getOne();
-
-    const minId = lastPost ? Number(lastPost.telegram_post_id) : 0;
-
-    // Берём новые посты с ID > minId
-    // TODO: добавить полноценную пагинацию (offsetId / addOffset), если постов очень много.
-    const posts = await client.getMessages(tgChannel, {
-      limit: 100,
-      minId,
-    });
-
-    this.logger.debug(
-      `syncNewPostsForChannel: fetched ${posts.length} new posts for @${username} (minId=${minId})`,
+    // 1) Новые посты (id > maxTelegramPostIdBefore)
+    await this.syncNewPosts(
+      client,
+      tgChannel,
+      channel,
+      windowFrom,
+      now,
+      maxTelegramPostIdBefore,
     );
 
-    for (const msg of posts) {
-      const post = msg as Api.Message;
+    // 2) Ресинк уже существующих постов
+    await this.syncExistingPosts(
+      client,
+      tgChannel,
+      channel,
+      windowFrom,
+      now,
+      maxTelegramPostIdBefore,
+    );
+  }
 
-      if (!post || typeof post.id !== 'number') {
-        continue;
-      }
+  /**
+   * Синхронизируем только новые посты (id > maxTelegramPostIdBefore)
+   * и все комментарии к ним (с пагинацией по комментариям).
+   */
+  private async syncNewPosts(
+    client: any,
+    tgChannel: any,
+    channel: Channel,
+    windowFrom: Date,
+    now: Date,
+    maxTelegramPostIdBefore: number,
+  ): Promise<void> {
+    let minId = maxTelegramPostIdBefore;
+    this.logger.debug(
+      `syncNewPosts: start fetching posts for channel=${channel.id} with minId=${minId}`,
+    );
 
-      const postId = post.id;
-      const rawPostDate: any = (post as any).date;
-      const publishedAt =
-        rawPostDate instanceof Date
-          ? rawPostDate
-          : new Date(rawPostDate * 1000);
-
-      // Ищем и создаём  запись поста
-      let channelPost = await this.channelPostRepo.findOne({
-        where: {
-          channel: { id: channel.id },
-          telegram_post_id: postId,
-        },
-        relations: ['channel'],
+    while (true) {
+      const messages = await client.getMessages(tgChannel, {
+        limit: 100,
+        minId,
       });
 
-      if (!channelPost) {
-        channelPost = this.channelPostRepo.create({
-          channel,
-          telegram_post_id: postId,
-          published_at: publishedAt,
-        });
-        await this.channelPostRepo.save(channelPost);
+      if (!messages || messages.length === 0) {
+        break;
       }
 
-      // Пропускаем, если у поста нет комментариев
-      if (
-        !post.replies ||
-        !post.replies.replies ||
-        post.replies.replies === 0
-      ) {
+      let batchMaxId = minId;
+
+      for (const msg of messages) {
+        const post = msg as Api.Message;
+        if (!post || typeof post.id !== 'number') continue;
+
+        const postId = post.id;
+        if (postId <= minId) {
+          continue;
+        }
+
+        const rawPostDate: any = (post as any).date;
+        const publishedAt =
+          rawPostDate instanceof Date
+            ? rawPostDate
+            : new Date(rawPostDate * 1000);
+
+        let channelPost = await this.channelPostRepo.findOne({
+          where: {
+            channel: { id: channel.id },
+            telegram_post_id: postId,
+          },
+          relations: ['channel'],
+        });
+
+        if (!channelPost) {
+          channelPost = this.channelPostRepo.create({
+            channel,
+            telegram_post_id: postId,
+            published_at: publishedAt,
+          });
+          await this.channelPostRepo.save(channelPost);
+        }
+
+        // Если Telegram уже знает, что комментариев нет - не ходим за реплаями.
+        if (post.replies && post.replies.replies && post.replies.replies > 0) {
+          await this.syncCommentsForPost(
+            client,
+            tgChannel,
+            channelPost,
+            windowFrom,
+            now,
+          );
+        } else {
+          // Но сам факт синка поста фиксируем
+          await this.touchPostSync(channelPost, now);
+        }
+
+        if (postId > batchMaxId) {
+          batchMaxId = postId;
+        }
+      }
+
+      if (batchMaxId === minId) {
+        break;
+      }
+
+      minId = batchMaxId;
+
+      if (messages.length < 100) {
+        break;
+      }
+    }
+  }
+
+  /**
+   * Гибридный ресинк уже существующих постов (которые были в БД до этого синка):
+   *
+   * - Берём посты с telegram_post_id <= maxTelegramPostIdBefore
+   *   и published_at в диапазоне последних 10 дней.
+   * - Для постов 0–3 дней - всегда обновляем комментарии.
+   * - Для постов 3–10 дней - обновляем, только если с последнего синка поста прошло >= 48 часов.
+   * - Посты старше 10 дней не попадают в выборку и не ресинкутся вообще.
+   */
+  private async syncExistingPosts(
+    client: any,
+    tgChannel: any,
+    channel: Channel,
+    windowFrom: Date,
+    now: Date,
+    maxTelegramPostIdBefore: number,
+  ): Promise<void> {
+    const mediumFromDate = new Date(
+      now.getTime() - MEDIUM_POST_DAYS * MS_PER_DAY,
+    );
+
+    // Берём все посты канала, которые:
+    // - были созданы раньше/равно maxTelegramPostIdBefore;
+    // - моложе 10 дней (т.е. published_at >= mediumFromDate).
+    const posts = await this.channelPostRepo
+      .createQueryBuilder('p')
+      .innerJoin('p.channel', 'ch')
+      .where('ch.id = :channelId', { channelId: channel.id })
+      .andWhere('p.telegram_post_id <= :maxId', {
+        maxId: maxTelegramPostIdBefore,
+      })
+      .andWhere('p.published_at >= :from', { from: mediumFromDate })
+      .getMany();
+
+    if (!posts.length) {
+      return;
+    }
+
+    for (const channelPost of posts) {
+      const ageMs = now.getTime() - channelPost.published_at.getTime();
+      const ageDays = ageMs / MS_PER_DAY;
+
+      let needResync = false;
+
+      if (ageDays <= FRESH_POST_DAYS) {
+        // Пост младше или равен 3 дням - всегда ресинк.
+        needResync = true;
+      } else if (ageDays <= MEDIUM_POST_DAYS) {
+        // 3–10 дней - ресинк по интервалу 48 часов
+        const postSync = await this.postSyncRepo.findOne({
+          where: { post: { id: channelPost.id } },
+          relations: ['post'],
+        });
+
+        if (!postSync) {
+          needResync = true;
+        } else {
+          const diffMs = now.getTime() - postSync.last_synced_at.getTime();
+          if (diffMs >= MEDIUM_RESYNC_INTERVAL_MS) {
+            needResync = true;
+          }
+        }
+      } else {
+        // >10 дней - игнорируем (не пересинхронизируем совсем)
+        needResync = false;
+      }
+
+      if (!needResync) {
         continue;
       }
 
-      // Получаем комментарии к этому посту
-      // TODO: добавить пагинацию по комментариям (если их > 100).
+      await this.syncCommentsForPost(
+        client,
+        tgChannel,
+        channelPost,
+        windowFrom,
+        now,
+      );
+    }
+  }
+
+  /**
+   * Синхронизирует ВСЕ комментарии к конкретному посту:
+   * - Полноценная пагинация по комментариям (limit=100, offsetId),
+   * - Отсечение по окну по дате комментария,
+   * - orIgnore по (post_id, telegram_comment_id), чтобы не плодить дубли,
+   * - Обновление last_synced_at для CoreChannelUsersPostCommentsSync.
+   */
+  private async syncCommentsForPost(
+    client: any,
+    tgChannel: any,
+    channelPost: ChannelPost,
+    windowFrom: Date,
+    now: Date,
+  ): Promise<void> {
+    const postId = Number(channelPost.telegram_post_id);
+    let offsetId = 0;
+    let stopByWindow = false;
+
+    this.logger.debug(
+      `syncCommentsForPost: syncing comments for post ${postId} (channelPost.id=${channelPost.id})`,
+    );
+
+    while (!stopByWindow) {
       const replies = await client.getMessages(tgChannel, {
         replyTo: postId,
         limit: 100,
+        offsetId,
       });
+
+      if (!replies || replies.length === 0) {
+        break;
+      }
 
       for (const reply of replies) {
         const r = reply as Api.Message;
         if (!r) continue;
 
-        // Дата комментария
         const rawCommentDate: any = (r as any).date;
         const commentedAt =
           rawCommentDate instanceof Date
             ? rawCommentDate
             : new Date(rawCommentDate * 1000);
 
-        // Отсекаем комментарии, которые уже вышли за окно
+        // Если комментарий старше окна - считаем, что дальше будут ещё старше.
         if (commentedAt < windowFrom) {
+          stopByWindow = true;
           continue;
         }
 
@@ -303,19 +482,19 @@ export class CoreChannelUsersService {
           authorType = 'chat';
         } else {
           this.logger.debug(
-            `syncNewPostsForChannel: skip comment without resolvable author (messageId=${telegramCommentId})`,
+            `syncCommentsForPost: skip comment without resolvable author (messageId=${telegramCommentId})`,
           );
           continue;
         }
 
         if (!authorTelegramId) {
           this.logger.debug(
-            `syncNewPostsForChannel: skip comment without authorTelegramId (messageId=${telegramCommentId})`,
+            `syncCommentsForPost: skip comment without authorTelegramId (messageId=${telegramCommentId})`,
           );
           continue;
         }
 
-        // Апсертим автора в users по telegram_user_id.
+        // Апсертим автора в users по telegram_user_id (это может быть человек, канал или чат).
         await this.userRepo.upsert(
           { telegram_user_id: authorTelegramId },
           { conflictPaths: ['telegram_user_id'] },
@@ -327,7 +506,7 @@ export class CoreChannelUsersService {
 
         if (!user) {
           this.logger.warn(
-            `syncNewPostsForChannel: failed to find user after upsert, telegram_user_id=${authorTelegramId}`,
+            `syncCommentsForPost: failed to find user after upsert, telegram_user_id=${authorTelegramId}`,
           );
           continue;
         }
@@ -348,23 +527,43 @@ export class CoreChannelUsersService {
           .execute();
       }
 
-      // Отмечаем, что по этому посту мы синкались
-      let postSync = await this.postSyncRepo.findOne({
-        where: { post: { id: channelPost.id } },
-        relations: ['post'],
-      });
-
-      if (!postSync) {
-        postSync = this.postSyncRepo.create({
-          post: channelPost,
-          last_synced_at: now,
-        });
-      } else {
-        postSync.last_synced_at = now;
+      const last = replies[replies.length - 1] as Api.Message;
+      if (!last || typeof last.id !== 'number') {
+        break;
       }
 
-      await this.postSyncRepo.save(postSync);
+      offsetId = last.id;
+
+      if (replies.length < 100) {
+        break;
+      }
     }
+
+    await this.touchPostSync(channelPost, now);
+  }
+
+  /**
+   * Обновляет / создаёт запись синка по посту.
+   */
+  private async touchPostSync(
+    channelPost: ChannelPost,
+    now: Date,
+  ): Promise<void> {
+    let postSync = await this.postSyncRepo.findOne({
+      where: { post: { id: channelPost.id } },
+      relations: ['post'],
+    });
+
+    if (!postSync) {
+      postSync = this.postSyncRepo.create({
+        post: channelPost,
+        last_synced_at: now,
+      });
+    } else {
+      postSync.last_synced_at = now;
+    }
+
+    await this.postSyncRepo.save(postSync);
   }
 
   /**
@@ -385,7 +584,7 @@ export class CoreChannelUsersService {
   /**
    * Загружает топ N пользователей по числу комментариев за окно по конкретному каналу.
    * Считает количество постов, в которых пользователь комментировал,
-   * и среднее число комментариев на пост для этого пользователя.
+   * и среднее число комментариев на активный пост для этого пользователя.
    */
   private async loadTopUsersForChannel(
     channel: Channel,
