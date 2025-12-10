@@ -250,6 +250,19 @@ export class CoreChannelUsersService {
 
     const tgChannel = await client.getEntity(username);
 
+    // Обновляем информацию о канале
+    const realChatId = Number((tgChannel as any).id);
+    await this.channelRepo.upsert(
+      {
+        id: channel.id,
+        telegram_chat_id: realChatId,
+        username: channel.username,
+        // здесь в будущем можно добавить title, description и т.д.
+      },
+      { conflictPaths: ['id'] },
+    );
+    channel.telegram_chat_id = realChatId;
+
     // 1) Новые посты (id > maxTelegramPostIdBefore)
     await this.syncNewPosts(
       client,
@@ -779,6 +792,7 @@ export class CoreChannelUsersService {
   /**
    * Удаляем комментарии, которые вышли за пределы окна.
    */
+  // TODO: нужно удалять ненужные записи по кроме а не после каждой синхронизации
   private async cleanupOldComments(windowFrom: Date): Promise<void> {
     this.logger.debug(
       `cleanupOldComments: deleting comments older than ${windowFrom.toISOString()}`,
