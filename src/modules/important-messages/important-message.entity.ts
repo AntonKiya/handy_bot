@@ -38,6 +38,12 @@ export class ImportantMessage {
   @Column({ name: 'notified_at', type: 'timestamp', nullable: true })
   notified_at: Date | null;
 
+  @Column({ name: 'replies_count', type: 'int', default: 0 })
+  replies_count: number;
+
+  @Column({ name: 'hype_notified_at', type: 'timestamp', nullable: true })
+  hype_notified_at: Date | null;
+
   // TODO: Добавить индексы для оптимизации:
   // - INDEX на (channel_id, created_at) для выборки последних сообщений
 }

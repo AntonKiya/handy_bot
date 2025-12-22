@@ -3,6 +3,7 @@ import { TelegramBotService } from './telegram-bot.service';
 import { CommandRouter } from './routers/command.router';
 import { MessageRouter } from './routers/message.router';
 import { CallbackRouter } from './routers/callback.router';
+import { ReactionRouter } from './routers/reaction.router';
 import { MenuModule } from '../modules/menu/menu.module';
 import { SummaryChannelModule } from '../modules/summary-channel/summary-channel.module';
 import { SummaryCommentsModule } from '../modules/summary-comments/summary-comments.module';
@@ -28,6 +29,7 @@ import { ImportantMessagesModule } from '../modules/important-messages/important
     MessageRouter,
     CallbackRouter,
     MembershipRouter,
+    ReactionRouter,
   ],
 })
 export class TelegramBotModule {}
