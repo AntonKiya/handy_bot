@@ -1,13 +1,14 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
+import { ReactionCount } from 'telegraf/types';
 import { ImportantMessage } from './important-message.entity';
-import { Channel } from '../channel/channel.entity';
 import { CategorizationService } from './categorization.service';
 import { GroupMessageData } from '../../telegram-bot/utils/types';
 import { getWordCount } from './utils/text-normalizer.util';
-import { MIN_WORD_COUNT } from './important-messages.constants';
+import { MIN_WORD_COUNT, THRESHOLDS } from './important-messages.constants';
 import { ChannelService } from '../channel/channel.service';
+import { HypeScorer } from './utils/scorers/hype.scorer';
 
 @Injectable()
 export class ImportantMessagesService {
@@ -18,6 +19,7 @@ export class ImportantMessagesService {
     private readonly importantMessageRepository: Repository<ImportantMessage>,
     private readonly channelService: ChannelService,
     private readonly categorizationService: CategorizationService,
+    private readonly hypeScorer: HypeScorer,
   ) {}
 
   /**
@@ -79,7 +81,7 @@ export class ImportantMessagesService {
   }
 
   /**
-   * Сохранение важного сообщения и подготовка к отправке уведомлений
+   * Сохранение важного сообщения
    * Возвращает ID сохраненного сообщения
    *
    * Вызывается из Flow
@@ -107,6 +109,8 @@ export class ImportantMessagesService {
       telegram_user_id: userId,
       text,
       notified_at: null,
+      replies_count: 0,
+      hype_notified_at: null,
     });
 
     const saved = await this.importantMessageRepository.save(importantMessage);
@@ -125,6 +129,111 @@ export class ImportantMessagesService {
     await this.importantMessageRepository.update(
       { id: messageId },
       { notified_at: new Date() },
+    );
+  }
+
+  // ============= HYPE METHODS =============
+
+  /**
+   * Подсчет общего количества реакций
+   * Вызывается из Flow
+   */
+  calculateTotalReactions(reactions: ReactionCount[]): number {
+    return reactions.reduce((sum, reaction) => sum + reaction.total_count, 0);
+  }
+
+  /**
+   * Получение сообщения по telegram_message_id и channelId
+   */
+  async getMessageByTelegramId(
+    channelId: string,
+    telegramMessageId: number,
+  ): Promise<ImportantMessage | null> {
+    return this.importantMessageRepository.findOne({
+      where: {
+        channel: { id: channelId },
+        telegram_message_id: telegramMessageId,
+      },
+      relations: ['channel'],
+    });
+  }
+
+  /**
+   * Инкремент счетчика ответов
+   * Вызывается из Flow
+   */
+  async incrementRepliesCount(
+    channelId: string,
+    telegramMessageId: number,
+  ): Promise<void> {
+    await this.importantMessageRepository.increment(
+      {
+        channel: { id: channelId },
+        telegram_message_id: telegramMessageId,
+      },
+      'replies_count',
+      1,
+    );
+
+    this.logger.debug(
+      `Incremented replies_count for message ${telegramMessageId} in channel ${channelId}`,
+    );
+  }
+
+  /**
+   * Проверка hype порога
+   * Возвращает true если порог достигнут и уведомление еще не отправлено
+   *
+   * Вызывается из Flow
+   */
+  async checkHypeThreshold(
+    channelId: string,
+    telegramMessageId: number,
+    reactionsCount: number,
+  ): Promise<boolean> {
+    const message = await this.getMessageByTelegramId(
+      channelId,
+      telegramMessageId,
+    );
+
+    if (!message) {
+      return false;
+    }
+
+    // Проверяем что уведомление еще не отправлено
+    if (message.hype_notified_at !== null) {
+      return false;
+    }
+
+    // Вычисляем hype score
+    const hypeResult = this.hypeScorer.calculateScore(
+      reactionsCount,
+      message.replies_count,
+    );
+
+    this.logger.debug(
+      `Hype score for message ${message.telegram_message_id}: ${hypeResult.score} (reactions: ${reactionsCount}, replies: ${message.replies_count})`,
+    );
+
+    // Возвращаем true если порог достигнут
+    return hypeResult.score >= THRESHOLDS.HYPE;
+  }
+
+  /**
+   * Обновление времени отправки hype уведомления
+   *
+   * Вызывается из Flow после отправки уведомления
+   */
+  async updateHypeNotifiedAt(
+    channelId: string,
+    telegramMessageId: number,
+  ): Promise<void> {
+    await this.importantMessageRepository.update(
+      {
+        channel: { id: channelId },
+        telegram_message_id: telegramMessageId,
+      },
+      { hype_notified_at: new Date() },
     );
   }
 }

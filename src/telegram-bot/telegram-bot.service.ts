@@ -9,6 +9,7 @@ import { CommandRouter } from './routers/command.router';
 import { MessageRouter } from './routers/message.router';
 import { CallbackRouter } from './routers/callback.router';
 import { MembershipRouter } from './routers/membership.router';
+import { ReactionRouter } from './routers/reaction.router';
 
 @Injectable()
 export class TelegramBotService implements OnModuleInit, OnApplicationShutdown {
@@ -20,6 +21,7 @@ export class TelegramBotService implements OnModuleInit, OnApplicationShutdown {
     private readonly messageRouter: MessageRouter,
     private readonly callbackRouter: CallbackRouter,
     private readonly membershipRouter: MembershipRouter,
+    private readonly reactionRouter: ReactionRouter,
   ) {}
 
   async onModuleInit() {
@@ -53,6 +55,10 @@ export class TelegramBotService implements OnModuleInit, OnApplicationShutdown {
 
     // Централизованный обработчик my_chat_member (добавление бота)
     this.bot.on('my_chat_member', (ctx) => this.membershipRouter.route(ctx));
+
+    this.bot.on('message_reaction_count', (ctx) =>
+      this.reactionRouter.route(ctx),
+    );
 
     this.bot
       .launch()

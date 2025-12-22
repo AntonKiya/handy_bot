@@ -1,11 +1,13 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { Context } from 'telegraf';
+import { ReactionCount } from 'telegraf/types';
 import { ImportantMessagesService } from './important-messages.service';
 import { GroupMessageData } from '../../telegram-bot/utils/types';
 import { buildMessageLink } from './utils/link-builder.util';
 import { ImportantMessagesAction } from './important-messages.callbacks';
 import { UserChannelsService } from '../user-channels/user-channels.service';
 import { buildImportantMessagesNotificationKeyboard } from './important-messages.keyboard';
+import { ChannelService } from '../channel/channel.service';
 
 @Injectable()
 export class ImportantMessagesFlow {
@@ -14,6 +16,7 @@ export class ImportantMessagesFlow {
   constructor(
     private readonly importantMessagesService: ImportantMessagesService,
     private readonly userChannelsService: UserChannelsService,
+    private readonly channelService: ChannelService,
   ) {}
 
   /**
@@ -67,7 +70,7 @@ export class ImportantMessagesFlow {
 
     // Отправляем уведомления админам
     await this.sendNotificationToAdmins(
-      ctx,
+      ctx.telegram,
       savedMessageId,
       messageData,
       categories,
@@ -78,10 +81,147 @@ export class ImportantMessagesFlow {
   }
 
   /**
+   * Обработка reply на важное сообщение
+   * Вызывается из Router
+   */
+  async handleReply(
+    ctx: Context,
+    chatId: number,
+    replyToMessageId: number,
+  ): Promise<void> {
+    try {
+      // Получаем канал
+      const channel =
+        await this.channelService.getChannelByTelegramChatId(chatId);
+
+      if (!channel) {
+        return;
+      }
+
+      // Инкрементим счетчик
+      await this.importantMessagesService.incrementRepliesCount(
+        channel.id,
+        replyToMessageId,
+      );
+
+      // Проверяем hype порог (reactions = 0, т.к. проверяем только replies)
+      const shouldNotify =
+        await this.importantMessagesService.checkHypeThreshold(
+          channel.id,
+          replyToMessageId,
+          0,
+        );
+
+      if (shouldNotify) {
+        await this.sendHypeNotification(ctx, channel.id, replyToMessageId);
+      }
+    } catch (error) {
+      this.logger.error(`Error handling reply: ${error.message}`, error.stack);
+    }
+  }
+
+  /**
+   * Обработка события message_reaction_count
+   * Вызывается из Router
+   */
+  async handleReactionCount(
+    ctx: Context,
+    chatId: number,
+    messageId: number,
+    reactions: ReactionCount[],
+  ): Promise<void> {
+    try {
+      // Получаем канал
+      const channel =
+        await this.channelService.getChannelByTelegramChatId(chatId);
+
+      if (!channel) {
+        return;
+      }
+
+      // Подсчитываем общее количество реакций через Service
+      const reactionsCount =
+        this.importantMessagesService.calculateTotalReactions(reactions);
+
+      // Проверяем hype порог
+      const shouldNotify =
+        await this.importantMessagesService.checkHypeThreshold(
+          channel.id,
+          messageId,
+          reactionsCount,
+        );
+
+      if (shouldNotify) {
+        await this.sendHypeNotification(ctx, channel.id, messageId);
+      }
+    } catch (error) {
+      this.logger.error(
+        `Error handling reaction count: ${error.message}`,
+        error.stack,
+      );
+    }
+  }
+
+  /**
+   * Отправка hype уведомления
+   * Приватный метод
+   */
+  private async sendHypeNotification(
+    ctx: Context,
+    channelId: string,
+    telegramMessageId: number,
+  ): Promise<void> {
+    const message = await this.importantMessagesService.getMessageByTelegramId(
+      channelId,
+      telegramMessageId,
+    );
+
+    if (!message) {
+      return;
+    }
+
+    this.logger.log(
+      `Sending hype notification for message ${telegramMessageId} in channel ${channelId}`,
+    );
+
+    // Формируем messageData
+    const messageData: GroupMessageData = {
+      chatId: message.channel.telegram_chat_id,
+      chatTitle: null,
+      chatType: 'supergroup',
+      chatUsername: message.channel.username,
+      userId: message.telegram_user_id,
+      text: message.text,
+      messageId: message.telegram_message_id,
+      timestamp: message.created_at,
+      isReply: false,
+      replyToMessageId: null,
+      hasPhoto: false,
+      hasVideo: false,
+      hasDocument: false,
+      hasSticker: false,
+      hasAudio: false,
+      hasVoice: false,
+    };
+
+    // Отправляем уведомление с категорией 'hype'
+    await this.sendNotificationToAdmins(ctx.telegram, message.id, messageData, [
+      'hype',
+    ]);
+
+    // Обновляем hype_notified_at
+    await this.importantMessagesService.updateHypeNotifiedAt(
+      channelId,
+      telegramMessageId,
+    );
+  }
+
+  /**
    * Отправка уведомлений админам
+   * Единый текст для всех категорий
    */
   private async sendNotificationToAdmins(
-    ctx: Context,
+    telegram: Context['telegram'],
     messageId: string,
     messageData: GroupMessageData,
     categories: string[],
@@ -114,7 +254,7 @@ export class ImportantMessagesFlow {
     // Отправляем каждому админу
     for (const adminId of adminIds) {
       try {
-        await ctx.telegram.sendMessage(adminId, text, keyboard);
+        await telegram.sendMessage(adminId, text, keyboard);
 
         this.logger.debug(
           `Notification sent to admin ${adminId} for message ${messageId}`,
