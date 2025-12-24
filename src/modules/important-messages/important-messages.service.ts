@@ -264,7 +264,7 @@ export class ImportantMessagesService {
 
   /**
    * Сохранение сообщения для отслеживания hype (минимальная запись)
-   * Используется когда на пост отвечают, но сам пост не был сохранен
+   * Используется когда на пост/комментарий отвечают, но сам пост/комментарий не был сохранен
    */
   async saveMessageForHypeTracking(
     channelId: string,
@@ -281,6 +281,15 @@ export class ImportantMessagesService {
 
     // Получаем данные из reply_to_message
     const replyToMessage = (ctx.message as any)?.reply_to_message;
+
+    // Пропускаем автофорварды (посты) - hype на посты не нужен
+    if (replyToMessage?.is_automatic_forward === true) {
+      this.logger.debug(
+        `Skipping auto-forward (post) ${telegramMessageId} - no hype tracking for posts`,
+      );
+      return;
+    }
+
     const userId = replyToMessage?.from?.id || 0;
     const text = replyToMessage?.text || null;
 
@@ -300,6 +309,10 @@ export class ImportantMessagesService {
     });
 
     await this.importantMessageRepository.save(importantMessage);
+
+    this.logger.debug(
+      `Created hype tracking entry for message ${telegramMessageId}, post_message_id=${postMessageId}`,
+    );
   }
 
   /**
