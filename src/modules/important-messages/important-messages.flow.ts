@@ -3,7 +3,7 @@ import { Context } from 'telegraf';
 import { ReactionType } from 'telegraf/types';
 import { ImportantMessagesService } from './important-messages.service';
 import { GroupMessageData } from '../../telegram-bot/utils/types';
-import { buildMessageLink } from './utils/link-builder.util';
+import { buildMessageLink, buildCommentLink } from './utils/link-builder.util';
 import { ImportantMessagesAction } from './important-messages.callbacks';
 import { UserChannelsService } from '../user-channels/user-channels.service';
 import { buildImportantMessagesNotificationKeyboard } from './important-messages.keyboard';
@@ -30,7 +30,10 @@ export class ImportantMessagesFlow {
     try {
       // Service сохраняет сообщение
       const savedMessageId =
-        await this.importantMessagesService.saveImportantMessage(messageData);
+        await this.importantMessagesService.saveImportantMessage(
+          messageData,
+          ctx,
+        );
 
       if (!savedMessageId) {
         return;
@@ -112,15 +115,10 @@ export class ImportantMessagesFlow {
 
       // Если записи нет - создаем (это пост, на который отвечают)
       if (!message) {
-        const replyToMessage = (ctx.message as any)?.reply_to_message;
-        const originalUserId = replyToMessage?.from?.id || null;
-        const originalText = replyToMessage?.text || null;
-
         await this.importantMessagesService.saveMessageForHypeTracking(
           channel.id,
           replyToMessageId,
-          originalUserId,
-          originalText,
+          ctx,
         );
       }
 
@@ -176,9 +174,7 @@ export class ImportantMessagesFlow {
         await this.importantMessagesService.saveMessageForHypeTracking(
           channel.id,
           messageId,
-          // TODO: Чтобы не передавать 0 и null, можно сохранять каждое сообщение заранее
-          0, // telegramUserId отправителя сообщения на которое поставили рекацию - неизвестен
-          null, // text отправителя сообщения на которое поставили рекацию - неизвестен
+          ctx,
         );
       }
 
@@ -258,10 +254,13 @@ export class ImportantMessagesFlow {
       hasVoice: false,
     };
 
-    // Отправляем уведомление с категорией 'hype'
-    await this.sendNotificationToAdmins(ctx.telegram, message.id, messageData, [
-      'hype',
-    ]);
+    await this.sendNotificationToAdmins(
+      ctx.telegram,
+      message.id,
+      messageData,
+      ['hype'],
+      message.post_message_id,
+    );
 
     // Обновляем hype_notified_at
     await this.importantMessagesService.updateHypeNotifiedAt(
@@ -279,6 +278,7 @@ export class ImportantMessagesFlow {
     messageId: string,
     messageData: GroupMessageData,
     categories: string[],
+    postMessageId?: number | null,
   ): Promise<void> {
     const adminIds =
       await this.userChannelsService.getChannelAdminsByTelegramChatId(
@@ -295,13 +295,27 @@ export class ImportantMessagesFlow {
     // Формируем текст и кнопки
     const text = this.buildNotificationText(messageData, categories);
 
-    const keyboard = buildImportantMessagesNotificationKeyboard(
-      buildMessageLink(
+    let messageLink = '';
+    if (messageData.chatUsername && postMessageId && messageData.messageId) {
+      messageLink = buildCommentLink(
+        messageData.chatUsername,
+        postMessageId,
+        messageData.messageId,
+      );
+    } else {
+      // Формируем ссылку с fallback
+      messageLink = buildMessageLink(
         messageData.chatId,
         messageData.messageId,
         messageData.chatType,
         messageData.chatUsername,
-      ),
+      );
+    }
+
+    this.logger.debug(`Generated link: ${messageLink}`);
+
+    const keyboard = buildImportantMessagesNotificationKeyboard(
+      messageLink,
       messageId,
     );
 
